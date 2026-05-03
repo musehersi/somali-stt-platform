@@ -1,46 +1,84 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
-import {
-  Upload, Mic, FileAudio, FileVideo, Download, Copy,
-  CheckCheck, Loader2, Zap, Globe, BarChart3, X
-} from "lucide-react";
-import clsx from "clsx";
+import { useState, useRef, useCallback, useEffect } from "react";
 
-type Stage = "idle" | "loading" | "transcribing" | "done" | "error";
+// ─── Types ────────────────────────────────────────────────────────────────────
+type Theme  = "dark" | "light";
+type Tab    = "upload" | "record";
+type Stage  = "idle" | "processing" | "done" | "error";
+interface Result { text: string; words: number; chars: number; duration: number; elapsed: number; }
 
-interface TranscriptResult {
-  text: string;
-  wordCount: number;
-  charCount: number;
-  duration: number;
-  elapsed: number;
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const fmt = (s: number) => s < 60 ? `${s.toFixed(1)}s` : `${(s/60).toFixed(1)}m`;
+const fmtSize = (b: number) => b > 1_048_576 ? `${(b/1_048_576).toFixed(1)} MB` : `${(b/1024).toFixed(0)} KB`;
+const isVideo = (f: File) => f.type.startsWith("video/");
+
+// ─── Direct HF call for large files (bypasses 4.5MB Vercel limit) ─────────────
+async function transcribeDirect(file: File): Promise<string> {
+  const { Client } = await import("@gradio/client");
+  const client = await Client.connect("ooloteam/SomaliSpeechToText");
+  const blob = new Blob([await file.arrayBuffer()], { type: file.type || "audio/wav" });
+  const result = await client.predict("/transcribe_file", {
+    audio_file: blob,
+    mic_file: null,
+    video_file: null,
+  });
+  const data = result.data as unknown[];
+  return (data[0] as string) ?? "";
 }
 
+// ─── Main Component ───────────────────────────────────────────────────────────
 export default function Home() {
-  const [stage, setStage] = useState<Stage>("idle");
-  const [dragOver, setDragOver] = useState(false);
-  const [file, setFile] = useState<File | null>(null);
+  const [theme, setTheme]       = useState<Theme>("dark");
+  const [tab, setTab]           = useState<Tab>("upload");
+  const [file, setFile]         = useState<File | null>(null);
+  const [mediaURL, setMediaURL] = useState<string | null>(null);
+  const [stage, setStage]       = useState<Stage>("idle");
   const [progress, setProgress] = useState(0);
-  const [progressMsg, setProgressMsg] = useState("");
-  const [result, setResult] = useState<TranscriptResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [progMsg, setProgMsg]   = useState("");
+  const [result, setResult]     = useState<Result | null>(null);
+  const [error, setError]       = useState<string | null>(null);
+  const [copied, setCopied]     = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+
+  // Recording state
+  const [recording, setRecording] = useState(false);
+  const [recSeconds, setRecSeconds] = useState(0);
+  const [recBlob, setRecBlob]     = useState<Blob | null>(null);
+  const [recURL, setRecURL]       = useState<string | null>(null);
+
+  const mediaRecRef  = useRef<MediaRecorder | null>(null);
+  const recChunksRef = useRef<Blob[]>([]);
+  const recTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const canvasRef    = useRef<HTMLCanvasElement>(null);
+  const animFrameRef = useRef<number>(0);
+  const analyserRef  = useRef<AnalyserNode | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const ACCEPT = ".mp3,.wav,.ogg,.flac,.m4a,.aac,.opus,.mp4,.webm,.mkv,.mov,.avi";
+  // ── Theme persistence ──────────────────────────────────────────────────────
+  useEffect(() => {
+    const saved = localStorage.getItem("stt-theme") as Theme | null;
+    if (saved) setTheme(saved);
+  }, []);
 
-  // ── File handling ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("stt-theme", theme);
+  }, [theme]);
+
+  // ── File handling ──────────────────────────────────────────────────────────
   const handleFile = useCallback((f: File) => {
     if (f.size > 52_428_800) {
-      setError("File too large. Maximum size is 50 MB.");
+      setError("File exceeds 50 MB. Please trim or compress it.");
       return;
     }
+    if (mediaURL) URL.revokeObjectURL(mediaURL);
     setFile(f);
+    setMediaURL(URL.createObjectURL(f));
     setResult(null);
     setError(null);
     setStage("idle");
-  }, []);
+  }, [mediaURL]);
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -49,62 +87,157 @@ export default function Home() {
     if (f) handleFile(f);
   };
 
-  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    if (f) handleFile(f);
+  // ── Waveform visualiser ───────────────────────────────────────────────────
+  const drawWave = useCallback(() => {
+    const canvas   = canvasRef.current;
+    const analyser = analyserRef.current;
+    if (!canvas || !analyser) return;
+    const ctx  = canvas.getContext("2d")!;
+    const buf  = new Uint8Array(analyser.frequencyBinCount);
+
+    const draw = () => {
+      animFrameRef.current = requestAnimationFrame(draw);
+      analyser.getByteTimeDomainData(buf);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const isDark = theme === "dark";
+      ctx.strokeStyle = isDark ? "#00d4aa" : "#00a87d";
+      ctx.lineWidth   = 2.5;
+      ctx.shadowColor = isDark ? "#00d4aa88" : "#00a87d44";
+      ctx.shadowBlur  = 8;
+      ctx.beginPath();
+
+      const sliceW = canvas.width / buf.length;
+      let x = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const y = (buf[i] / 128) * (canvas.height / 2);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        x += sliceW;
+      }
+      ctx.stroke();
+    };
+    draw();
+  }, [theme]);
+
+  // ── Live recording ─────────────────────────────────────────────────────────
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // Audio context for waveform
+      const ctx     = new AudioContext();
+      const source  = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+      drawWave();
+
+      const mr = new MediaRecorder(stream);
+      mediaRecRef.current  = mr;
+      recChunksRef.current = [];
+
+      mr.ondataavailable = (e) => { if (e.data.size > 0) recChunksRef.current.push(e.data); };
+      mr.onstop = () => {
+        const blob = new Blob(recChunksRef.current, { type: "audio/webm" });
+        const url  = URL.createObjectURL(blob);
+        setRecBlob(blob);
+        setRecURL(url);
+        stream.getTracks().forEach(t => t.stop());
+        cancelAnimationFrame(animFrameRef.current);
+        analyserRef.current = null;
+      };
+
+      mr.start(100);
+      setRecording(true);
+      setRecSeconds(0);
+      setRecBlob(null);
+      setRecURL(null);
+
+      recTimerRef.current = setInterval(() => setRecSeconds(s => s + 1), 1000);
+    } catch {
+      setError("Microphone access denied. Please allow microphone in your browser.");
+    }
   };
 
-  // ── Transcription ─────────────────────────────────────────────────────────
+  const stopRecording = () => {
+    mediaRecRef.current?.stop();
+    if (recTimerRef.current) clearInterval(recTimerRef.current);
+    setRecording(false);
+  };
+
+  // ── Transcription ──────────────────────────────────────────────────────────
   const transcribe = async () => {
-    if (!file) return;
-    setStage("loading");
+    const source = tab === "record"
+      ? (recBlob ? new File([recBlob], "recording.webm", { type: "audio/webm" }) : null)
+      : file;
+
+    if (!source) {
+      setError(tab === "record" ? "Please record audio first." : "Please upload a file first.");
+      return;
+    }
+
+    setStage("processing");
     setProgress(5);
-    setProgressMsg("Preparing audio...");
+    setProgMsg("Preparing…");
     setError(null);
 
+    const t0 = Date.now();
+    const sizeMB = source.size / 1_048_576;
+
     try {
-      const startTime = Date.now();
-      const formData = new FormData();
-      formData.append("file", file);
+      let text = "";
 
-      setProgress(15);
-      setProgressMsg("Uploading to transcription engine...");
-      setStage("transcribing");
+      // Files ≥ 4 MB bypass Vercel and call HuggingFace directly
+      if (sizeMB >= 4) {
+        setProgMsg(`Large file (${fmtSize(source.size)}) — connecting directly to AI…`);
+        setProgress(15);
+        text = await transcribeDirect(source);
+        setProgress(90);
+      } else {
+        setProgress(20);
+        setProgMsg("Uploading…");
+        const fd = new FormData();
+        fd.append("file", source);
 
-      const res = await fetch("/api/transcribe", {
-        method: "POST",
-        body: formData,
-      });
+        const res = await fetch("/api/transcribe", { method: "POST", body: fd });
+        setProgress(75);
+        setProgMsg("Processing…");
 
-      setProgress(80);
-      setProgressMsg("Processing response...");
-
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "Transcription failed");
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error((j as { error?: string }).error ?? "Transcription failed.");
+        }
+        const j = await res.json() as { text: string };
+        text = j.text;
       }
 
-      const data = await res.json();
-      const elapsed = (Date.now() - startTime) / 1000;
+      if (!text || text.startsWith("⚠️") || text.startsWith("❌")) {
+        throw new Error(text || "No speech detected.");
+      }
 
+      const words = text.trim().split(/\s+/).filter(Boolean).length;
+      // Rough duration from file if available
+      const durEst = source.size / (16000 * 2); // rough estimate
       setResult({
-        text: data.text,
-        wordCount: data.text.split(/\s+/).filter(Boolean).length,
-        charCount: data.text.length,
-        duration: data.duration ?? 0,
-        elapsed,
+        text: text.trim(),
+        words,
+        chars: text.length,
+        duration: durEst,
+        elapsed: (Date.now() - t0) / 1000,
       });
-
       setProgress(100);
-      setProgressMsg("Done!");
       setStage("done");
-    } catch (e: any) {
-      setError(e.message ?? "An unexpected error occurred.");
+
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg.includes("503") || msg.includes("waking")
+        ? "The AI is waking up (it sleeps after inactivity). Wait 30s and try again."
+        : msg);
       setStage("error");
     }
   };
 
-  // ── Copy ──────────────────────────────────────────────────────────────────
   const copyText = async () => {
     if (!result) return;
     await navigator.clipboard.writeText(result.text);
@@ -112,252 +245,621 @@ export default function Home() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // ── Download ──────────────────────────────────────────────────────────────
   const downloadTxt = () => {
     if (!result) return;
     const blob = new Blob([result.text], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `somali-transcript-${Date.now()}.txt`;
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(blob),
+      download: `somali-transcript-${Date.now()}.txt`,
+    });
     a.click();
-    URL.revokeObjectURL(url);
   };
 
   const reset = () => {
-    setFile(null);
-    setResult(null);
-    setError(null);
-    setStage("idle");
-    setProgress(0);
+    if (mediaURL) URL.revokeObjectURL(mediaURL);
+    if (recURL)   URL.revokeObjectURL(recURL);
+    setFile(null); setMediaURL(null); setRecBlob(null); setRecURL(null);
+    setResult(null); setError(null); setStage("idle"); setProgress(0);
   };
 
-  const isProcessing = stage === "loading" || stage === "transcribing";
-  const fileIsVideo = file?.type?.startsWith("video/");
+  const busy = stage === "processing";
 
   return (
-    <main className="min-h-screen" style={{ background: "var(--dark)" }}>
-      {/* ── Nav ── */}
-      <nav className="border-b border-slate-800/60 backdrop-blur-sm sticky top-0 z-40"
-        style={{ background: "rgba(10,15,30,0.9)" }}>
-        <div className="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="text-2xl">🎙️</span>
-            <span className="font-bold text-white text-lg">SomaliSTT</span>
-            <span className="text-xs px-2 py-0.5 rounded-full font-medium ml-1"
-              style={{ background: "rgba(13,115,119,0.25)", color: "#14a085" }}>
-              Beta
+    <>
+      {/* ── Global styles injected into <head> via Next.js ── */}
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Outfit:wght@300;400;500;600&display=swap');
+
+        :root[data-theme="dark"] {
+          --bg:          #050d1a;
+          --bg2:         #081424;
+          --surface:     #0d1f35;
+          --surface2:    #112540;
+          --border:      #1a3350;
+          --border2:     #1e3d5c;
+          --accent:      #00d4aa;
+          --accent2:     #00ffcc;
+          --accent-dim:  rgba(0,212,170,0.12);
+          --accent-glow: rgba(0,212,170,0.3);
+          --amber:       #ffb547;
+          --amber-dim:   rgba(255,181,71,0.12);
+          --text:        #d4eae4;
+          --text2:       #7a9eb0;
+          --text3:       #3d6070;
+          --error:       #ff6b6b;
+          --error-dim:   rgba(255,107,107,0.12);
+          --success:     #00d4aa;
+          --rec:         #ff4560;
+          --rec-dim:     rgba(255,69,96,0.15);
+          --shadow:      0 8px 32px rgba(0,0,0,0.5);
+          --shadow2:     0 2px 8px rgba(0,0,0,0.3);
+          --noise:       url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+        }
+        :root[data-theme="light"] {
+          --bg:          #f5f0e8;
+          --bg2:         #ede8df;
+          --surface:     #ffffff;
+          --surface2:    #faf8f4;
+          --border:      #e0d8cc;
+          --border2:     #cec5b6;
+          --accent:      #00a87d;
+          --accent2:     #007a5c;
+          --accent-dim:  rgba(0,168,125,0.1);
+          --accent-glow: rgba(0,168,125,0.25);
+          --amber:       #d4860a;
+          --amber-dim:   rgba(212,134,10,0.1);
+          --text:        #1a2a22;
+          --text2:       #5a7060;
+          --text3:       #9aaa9a;
+          --error:       #cc3333;
+          --error-dim:   rgba(204,51,51,0.08);
+          --success:     #00a87d;
+          --rec:         #cc2244;
+          --rec-dim:     rgba(204,34,68,0.1);
+          --shadow:      0 8px 32px rgba(0,0,0,0.12);
+          --shadow2:     0 2px 8px rgba(0,0,0,0.08);
+          --noise:       none;
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html { scroll-behavior: smooth; }
+
+        body {
+          font-family: 'Outfit', sans-serif;
+          background: var(--bg);
+          color: var(--text);
+          min-height: 100vh;
+          transition: background 0.4s ease, color 0.4s ease;
+          background-image: var(--noise);
+        }
+
+        ::selection { background: var(--accent-dim); color: var(--accent); }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg2); }
+        ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+        /* Transitions */
+        .t { transition: all 0.25s ease; }
+
+        /* Glowing border on focus */
+        input:focus, textarea:focus, button:focus-visible {
+          outline: 2px solid var(--accent);
+          outline-offset: 2px;
+        }
+      `}</style>
+
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+
+        {/* ── NAV ─────────────────────────────────────────────────────────── */}
+        <nav style={{
+          position: "sticky", top: 0, zIndex: 50,
+          background: "rgba(5,13,26,0.7)",
+          backdropFilter: "blur(20px)",
+          borderBottom: "1px solid var(--border)",
+          padding: "0 clamp(16px, 5vw, 48px)",
+        }}>
+          <div style={{ maxWidth: 1200, margin: "0 auto", height: 60,
+            display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+
+            {/* Logo */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{
+                width: 34, height: 34, borderRadius: 10,
+                background: "linear-gradient(135deg, var(--accent), #0099ff)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 18, boxShadow: "0 0 16px var(--accent-glow)",
+              }}>🎙</div>
+              <span style={{ fontFamily: "Syne", fontWeight: 800, fontSize: 18,
+                letterSpacing: "-0.5px", color: "var(--text)" }}>
+                Somali<span style={{ color: "var(--accent)" }}>STT</span>
+              </span>
+              <span style={{
+                fontSize: 10, fontFamily: "DM Mono", fontWeight: 500,
+                padding: "2px 8px", borderRadius: 20,
+                background: "var(--accent-dim)", color: "var(--accent)",
+                border: "1px solid var(--accent-glow)", letterSpacing: "0.08em",
+              }}>BETA</span>
+            </div>
+
+            {/* Nav links + theme toggle */}
+            <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
+              {[["About", "/about"], ["API", "/api-docs"]].map(([l, h]) => (
+                <a key={l} href={h} style={{
+                  color: "var(--text2)", fontSize: 14, fontWeight: 500,
+                  textDecoration: "none", transition: "color 0.2s",
+                }} onMouseEnter={e => (e.currentTarget.style.color = "var(--accent)")}
+                   onMouseLeave={e => (e.currentTarget.style.color = "var(--text2)")}>
+                  {l}
+                </a>
+              ))}
+
+              {/* Theme toggle */}
+              <button onClick={() => setTheme(t => t === "dark" ? "light" : "dark")}
+                style={{
+                  width: 44, height: 24, borderRadius: 12, border: "1px solid var(--border2)",
+                  background: theme === "dark" ? "var(--surface2)" : "var(--surface)",
+                  cursor: "pointer", position: "relative", transition: "all 0.3s",
+                  flexShrink: 0,
+                }}>
+                <div style={{
+                  position: "absolute", top: 3,
+                  left: theme === "dark" ? 22 : 3,
+                  width: 16, height: 16, borderRadius: "50%",
+                  background: theme === "dark" ? "var(--accent)" : "var(--amber)",
+                  transition: "left 0.3s cubic-bezier(.34,1.56,.64,1)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 9,
+                }}>
+                  {theme === "dark" ? "🌙" : "☀️"}
+                </div>
+              </button>
+            </div>
+          </div>
+        </nav>
+
+        {/* ── HERO ────────────────────────────────────────────────────────── */}
+        <div style={{ textAlign: "center", padding: "60px 24px 40px",
+          background: "radial-gradient(ellipse 70% 50% at 50% 0%, var(--accent-dim), transparent)",
+        }}>
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6,
+            padding: "6px 16px", borderRadius: 20, marginBottom: 20,
+            background: "var(--accent-dim)", border: "1px solid var(--accent-glow)",
+          }}>
+            <span style={{ color: "var(--accent)", fontSize: 12, fontFamily: "DM Mono", letterSpacing: "0.1em" }}>
+              ◎ LIVE
+            </span>
+            <span style={{ color: "var(--text2)", fontSize: 12 }}>
+              ooloteam/wav2vec2-somali · WER 0.20
             </span>
           </div>
-          <div className="flex items-center gap-6 text-sm text-slate-400">
-            <a href="/about" className="hover:text-white transition-colors">About</a>
-            <a href="/api-docs" className="hover:text-white transition-colors">API</a>
-            <a href="https://huggingface.co/ooloteam/wav2vec2-somali" target="_blank"
-              className="hover:text-teal-400 transition-colors flex items-center gap-1">
-              <span>Model</span>
-              <span className="text-xs">↗</span>
-            </a>
-          </div>
-        </div>
-      </nav>
 
-      <div className="max-w-5xl mx-auto px-6 py-12">
-        {/* ── Hero ── */}
-        <div className="text-center mb-12">
-          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-medium mb-6"
-            style={{ background: "rgba(13,115,119,0.15)", color: "#0d7377", border: "1px solid rgba(13,115,119,0.3)" }}>
-            <Zap size={14} /> Powered by wav2vec2-somali — WER 0.20
-          </div>
-          <h1 className="text-5xl font-bold text-white mb-4 tracking-tight">
-            Somali Speech to Text
+          <h1 style={{
+            fontFamily: "Syne", fontWeight: 800, fontSize: "clamp(2.4rem, 6vw, 4.2rem)",
+            lineHeight: 1.05, letterSpacing: "-2px", marginBottom: 16,
+            background: theme === "dark"
+              ? "linear-gradient(135deg, #fff 0%, var(--accent) 60%, #0099ff 100%)"
+              : "linear-gradient(135deg, var(--text) 0%, var(--accent) 60%, #0066cc 100%)",
+            WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+          }}>
+            Somali Speech<br />to Text
           </h1>
-          <p className="text-xl text-slate-400 max-w-2xl mx-auto leading-relaxed">
-            Transcribe Somali audio and video instantly. Free, private, and powered by
-            the best open-source Somali ASR model.
+
+          <p style={{ color: "var(--text2)", fontSize: "clamp(1rem, 2vw, 1.2rem)",
+            maxWidth: 520, margin: "0 auto 32px", lineHeight: 1.6, fontWeight: 300 }}>
+            The most accurate free Somali transcription tool. Upload audio, video,
+            or record live — get text in seconds.
           </p>
 
-          {/* Stats */}
-          <div className="flex justify-center gap-8 mt-8">
+          {/* Stats strip */}
+          <div style={{ display: "flex", justifyContent: "center", flexWrap: "wrap", gap: 8 }}>
             {[
-              { icon: <BarChart3 size={18} />, label: "Word Error Rate", value: "0.20" },
-              { icon: <Zap size={18} />, label: "Parameters", value: "315M" },
-              { icon: <Globe size={18} />, label: "Language", value: "Af Soomaali" },
-            ].map((s) => (
-              <div key={s.label} className="flex flex-col items-center gap-1">
-                <div className="flex items-center gap-1.5 font-bold text-2xl text-white">
-                  <span style={{ color: "#0d7377" }}>{s.icon}</span>
-                  {s.value}
-                </div>
-                <span className="text-xs text-slate-500 uppercase tracking-wide">{s.label}</span>
+              ["📊", "WER 0.20"],
+              ["⚡", "315M Params"],
+              ["🌍", "Af Soomaali"],
+              ["🎬", "Audio + Video"],
+              ["🎤", "Live Record"],
+              ["🆓", "Always Free"],
+            ].map(([icon, label]) => (
+              <div key={label} style={{
+                display: "flex", alignItems: "center", gap: 6,
+                padding: "6px 14px", borderRadius: 20,
+                background: "var(--surface)", border: "1px solid var(--border)",
+                fontSize: 13, color: "var(--text2)", fontFamily: "DM Mono",
+              }}>
+                <span>{icon}</span>
+                <span>{label}</span>
               </div>
             ))}
           </div>
         </div>
 
-        {/* ── Main Card ── */}
-        <div className="panel p-8 mb-6">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-            {/* Left: Upload */}
-            <div>
-              <h2 className="font-semibold text-white mb-4 flex items-center gap-2">
-                <Upload size={18} style={{ color: "#0d7377" }} />
-                Upload File
-              </h2>
+        {/* ── MAIN CARD ───────────────────────────────────────────────────── */}
+        <div style={{ maxWidth: 1200, margin: "0 auto", padding: "0 clamp(12px, 4vw, 32px) 80px",
+          width: "100%", flex: 1 }}>
 
-              {/* Drop zone */}
-              <div
-                className={clsx("upload-zone p-8 flex flex-col items-center justify-center cursor-pointer min-h-[200px]",
-                  { "dragging": dragOver })}
-                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-                onDragLeave={() => setDragOver(false)}
-                onDrop={onDrop}
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <input ref={fileInputRef} type="file" accept={ACCEPT}
-                  onChange={onFileChange} className="hidden" />
+          <div style={{
+            display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))",
+            gap: 20, alignItems: "start",
+          }}>
 
-                {file ? (
-                  <div className="text-center">
-                    <div className="text-4xl mb-3">{fileIsVideo ? "🎬" : "🎵"}</div>
-                    <div className="font-medium text-white text-sm truncate max-w-[220px]">
-                      {file.name}
-                    </div>
-                    <div className="text-xs text-slate-500 mt-1">
-                      {(file.size / 1_048_576).toFixed(1)} MB
-                    </div>
-                    <button onClick={(e) => { e.stopPropagation(); reset(); }}
-                      className="mt-3 text-xs text-slate-500 hover:text-red-400 flex items-center gap-1 mx-auto">
-                      <X size={12} /> Remove
-                    </button>
-                  </div>
-                ) : (
-                  <div className="text-center">
-                    <div className="flex gap-3 justify-center mb-4 opacity-60">
-                      <FileAudio size={28} style={{ color: "#0d7377" }} />
-                      <FileVideo size={28} style={{ color: "#14a085" }} />
-                    </div>
-                    <p className="text-slate-300 font-medium mb-1">Drop file here or click to browse</p>
-                    <p className="text-xs text-slate-500">MP3, WAV, OGG, FLAC, MP4, WebM, MKV • Max 50 MB</p>
-                  </div>
-                )}
-              </div>
-
-              {/* Progress */}
-              {isProcessing && (
-                <div className="mt-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs text-slate-400">{progressMsg}</span>
-                    <span className="text-xs text-slate-500">{progress}%</span>
-                  </div>
-                  <div className="h-2 rounded-full overflow-hidden" style={{ background: "#1e293b" }}>
-                    <div className="h-full rounded-full progress-bar transition-all duration-300"
-                      style={{ width: `${progress}%`, background: "linear-gradient(90deg, #0d7377, #14a085)" }} />
-                  </div>
-                </div>
-              )}
-
-              {/* Error */}
-              {error && (
-                <div className="mt-4 p-3 rounded-lg text-sm text-red-400"
-                  style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)" }}>
-                  ⚠️ {error}
-                </div>
-              )}
-
-              {/* Action buttons */}
-              <div className="flex gap-3 mt-5">
-                <button onClick={transcribe}
-                  disabled={!file || isProcessing}
-                  className="btn-primary flex-1 py-3 px-6 rounded-xl font-semibold text-white flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none">
-                  {isProcessing
-                    ? <><Loader2 size={18} className="animate-spin" /> Transcribing...</>
-                    : <><Zap size={18} /> Transcribe</>
-                  }
-                </button>
-                {(file || result) && (
-                  <button onClick={reset}
-                    className="py-3 px-4 rounded-xl font-medium text-slate-400 hover:text-white transition-colors"
-                    style={{ background: "#1e293b", border: "1px solid #334155" }}>
-                    <X size={18} />
+            {/* ── LEFT: INPUT PANEL ────────────────────────────────────────── */}
+            <div style={{
+              background: "var(--surface)", border: "1px solid var(--border)",
+              borderRadius: 20, overflow: "hidden", boxShadow: "var(--shadow)",
+            }}>
+              {/* Tab bar */}
+              <div style={{ display: "flex", borderBottom: "1px solid var(--border)" }}>
+                {([["upload", "📁 Upload"], ["record", "🎤 Record"]] as [Tab, string][]).map(([t, l]) => (
+                  <button key={t} onClick={() => { setTab(t); setError(null); }}
+                    style={{
+                      flex: 1, padding: "14px 16px", border: "none", cursor: "pointer",
+                      fontFamily: "Syne", fontWeight: 600, fontSize: 13,
+                      letterSpacing: "0.03em",
+                      background: tab === t ? "var(--accent-dim)" : "transparent",
+                      color: tab === t ? "var(--accent)" : "var(--text2)",
+                      borderBottom: tab === t ? "2px solid var(--accent)" : "2px solid transparent",
+                      transition: "all 0.2s",
+                    }}>
+                    {l}
                   </button>
-                )}
+                ))}
               </div>
 
-              {/* Mic note */}
-              <p className="text-xs text-slate-600 mt-3 flex items-center gap-1">
-                <Mic size={12} /> Live microphone recording coming soon
-              </p>
+              <div style={{ padding: 24 }}>
+
+                {/* ── UPLOAD TAB ─────────────────────────────────────────── */}
+                {tab === "upload" && (
+                  <>
+                    {/* Drop zone */}
+                    <div
+                      onClick={() => fileInputRef.current?.click()}
+                      onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                      onDragLeave={() => setDragOver(false)}
+                      onDrop={onDrop}
+                      style={{
+                        border: `2px dashed ${dragOver ? "var(--accent)" : "var(--border2)"}`,
+                        borderRadius: 14, padding: "32px 20px", textAlign: "center",
+                        cursor: "pointer", transition: "all 0.2s",
+                        background: dragOver ? "var(--accent-dim)" : "var(--surface2)",
+                        marginBottom: 16,
+                      }}
+                    >
+                      <input ref={fileInputRef} type="file" hidden
+                        accept="audio/*,video/*"
+                        onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
+                      {file ? (
+                        <div>
+                          <div style={{ fontSize: 36, marginBottom: 8 }}>{isVideo(file) ? "🎬" : "🎵"}</div>
+                          <div style={{ fontFamily: "DM Mono", fontSize: 13, color: "var(--accent)",
+                            marginBottom: 4, wordBreak: "break-all" }}>{file.name}</div>
+                          <div style={{ fontSize: 12, color: "var(--text3)" }}>{fmtSize(file.size)}</div>
+                        </div>
+                      ) : (
+                        <div>
+                          <div style={{ fontSize: 40, marginBottom: 12, opacity: 0.5 }}>⬆</div>
+                          <div style={{ fontSize: 15, fontWeight: 500, color: "var(--text)",
+                            marginBottom: 6 }}>Drop file here or click to browse</div>
+                          <div style={{ fontSize: 12, color: "var(--text3)", fontFamily: "DM Mono" }}>
+                            MP3 · WAV · FLAC · OGG · M4A · MP4 · WebM · MKV — up to 50 MB
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Playback */}
+                    {mediaURL && (
+                      <div style={{ marginBottom: 16 }}>
+                        <div style={{ fontSize: 11, fontFamily: "DM Mono", color: "var(--text3)",
+                          marginBottom: 6, letterSpacing: "0.08em" }}>▶ PREVIEW</div>
+                        {file && isVideo(file) ? (
+                          <video src={mediaURL} controls playsInline
+                            style={{ width: "100%", borderRadius: 10, maxHeight: 160,
+                              background: "#000", border: "1px solid var(--border)" }} />
+                        ) : (
+                          <audio src={mediaURL} controls
+                            style={{ width: "100%", height: 40, filter:
+                              theme === "dark" ? "invert(1) hue-rotate(160deg)" : "none",
+                              borderRadius: 8 }} />
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* ── RECORD TAB ───────────────────────────────────────────── */}
+                {tab === "record" && (
+                  <div>
+                    {/* Waveform canvas */}
+                    <div style={{
+                      borderRadius: 12, overflow: "hidden", marginBottom: 16,
+                      background: "var(--surface2)", border: "1px solid var(--border)",
+                      height: 80, display: "flex", alignItems: "center",
+                      justifyContent: recording ? "stretch" : "center",
+                    }}>
+                      {recording ? (
+                        <canvas ref={canvasRef} width={600} height={80}
+                          style={{ width: "100%", height: "100%" }} />
+                      ) : (
+                        <span style={{ color: "var(--text3)", fontSize: 12,
+                          fontFamily: "DM Mono" }}>
+                          {recURL ? "Recording ready" : "Waveform appears here while recording"}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Timer */}
+                    {(recording || recURL) && (
+                      <div style={{ textAlign: "center", marginBottom: 14,
+                        fontFamily: "DM Mono", fontSize: 28, fontWeight: 300,
+                        color: recording ? "var(--rec)" : "var(--accent)",
+                        letterSpacing: "0.05em",
+                      }}>
+                        {recording && (
+                          <span style={{ display: "inline-block", width: 10, height: 10,
+                            borderRadius: "50%", background: "var(--rec)",
+                            marginRight: 8, animation: "pulse 1s infinite",
+                          }} />
+                        )}
+                        {Math.floor(recSeconds / 60).toString().padStart(2, "0")}:
+                        {(recSeconds % 60).toString().padStart(2, "0")}
+                      </div>
+                    )}
+
+                    {/* Record / Stop button */}
+                    <button onClick={recording ? stopRecording : startRecording}
+                      style={{
+                        width: "100%", padding: "14px", borderRadius: 12, border: "none",
+                        cursor: "pointer", fontFamily: "Syne", fontWeight: 700, fontSize: 14,
+                        letterSpacing: "0.05em", marginBottom: 12, transition: "all 0.2s",
+                        background: recording
+                          ? "var(--rec-dim)"
+                          : "var(--accent-dim)",
+                        color: recording ? "var(--rec)" : "var(--accent)",
+                        border: `1px solid ${recording ? "var(--rec)" : "var(--accent)"}`,
+                        boxShadow: recording ? "0 0 20px var(--rec-dim)" : "none",
+                      }}>
+                      {recording ? "⏹ Stop Recording" : recURL ? "🔄 Record Again" : "🎤 Start Recording"}
+                    </button>
+
+                    {/* Playback for recorded audio */}
+                    {recURL && !recording && (
+                      <div>
+                        <div style={{ fontSize: 11, fontFamily: "DM Mono", color: "var(--text3)",
+                          marginBottom: 6, letterSpacing: "0.08em" }}>▶ PLAYBACK</div>
+                        <audio src={recURL} controls
+                          style={{ width: "100%", height: 40,
+                            filter: theme === "dark" ? "invert(1) hue-rotate(160deg)" : "none",
+                            borderRadius: 8 }} />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* ── Error ────────────────────────────────────────────────── */}
+                {error && (
+                  <div style={{
+                    padding: "12px 14px", borderRadius: 10, marginTop: 12,
+                    background: "var(--error-dim)", border: "1px solid var(--error)",
+                    color: "var(--error)", fontSize: 13, lineHeight: 1.5,
+                  }}>
+                    ⚠ {error}
+                  </div>
+                )}
+
+                {/* ── Progress bar ──────────────────────────────────────────── */}
+                {busy && (
+                  <div style={{ marginTop: 16 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between",
+                      marginBottom: 6, fontSize: 12 }}>
+                      <span style={{ color: "var(--text2)", fontFamily: "DM Mono" }}>{progMsg}</span>
+                      <span style={{ color: "var(--accent)", fontFamily: "DM Mono" }}>{progress}%</span>
+                    </div>
+                    <div style={{ height: 4, borderRadius: 2, background: "var(--border)",
+                      overflow: "hidden" }}>
+                      <div style={{
+                        height: "100%", borderRadius: 2, transition: "width 0.4s ease",
+                        width: `${progress}%`,
+                        background: "linear-gradient(90deg, var(--accent), #0099ff)",
+                        boxShadow: "0 0 8px var(--accent-glow)",
+                      }} />
+                    </div>
+                  </div>
+                )}
+
+                {/* ── Action buttons ────────────────────────────────────────── */}
+                <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+                  <button onClick={transcribe} disabled={busy}
+                    style={{
+                      flex: 1, padding: "13px 20px", border: "none", borderRadius: 12,
+                      cursor: busy ? "not-allowed" : "pointer", fontFamily: "Syne",
+                      fontWeight: 700, fontSize: 14, letterSpacing: "0.04em",
+                      background: busy
+                        ? "var(--surface2)"
+                        : "linear-gradient(135deg, var(--accent), #0099ff)",
+                      color: busy ? "var(--text3)" : "#fff",
+                      boxShadow: busy ? "none" : "0 4px 20px var(--accent-glow)",
+                      transition: "all 0.2s",
+                    }}>
+                    {busy ? "⏳ Transcribing…" : "🚀 Transcribe"}
+                  </button>
+                  {(file || recURL || result) && (
+                    <button onClick={reset}
+                      style={{
+                        padding: "13px 16px", borderRadius: 12,
+                        border: "1px solid var(--border2)", cursor: "pointer",
+                        background: "var(--surface2)", color: "var(--text2)",
+                        fontSize: 16, transition: "all 0.2s",
+                      }}>✕</button>
+                  )}
+                </div>
+              </div>
             </div>
 
-            {/* Right: Output */}
-            <div>
-              <h2 className="font-semibold text-white mb-4 flex items-center gap-2">
-                <span style={{ color: "#0d7377" }}>✦</span>
-                Somali Transcript
-              </h2>
+            {/* ── RIGHT: OUTPUT PANEL ──────────────────────────────────────── */}
+            <div style={{
+              background: "var(--surface)", border: "1px solid var(--border)",
+              borderRadius: 20, overflow: "hidden", boxShadow: "var(--shadow)",
+            }}>
+              {/* Header */}
+              <div style={{
+                padding: "16px 24px", borderBottom: "1px solid var(--border)",
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+              }}>
+                <span style={{ fontFamily: "Syne", fontWeight: 700, fontSize: 14,
+                  letterSpacing: "0.05em", color: "var(--text)" }}>
+                  ✦ TRANSCRIPT
+                </span>
+                {result && (
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={copyText} style={{
+                      padding: "6px 14px", borderRadius: 8, border: "1px solid var(--border2)",
+                      background: copied ? "var(--accent-dim)" : "var(--surface2)",
+                      color: copied ? "var(--accent)" : "var(--text2)",
+                      cursor: "pointer", fontSize: 12, fontFamily: "DM Mono",
+                      transition: "all 0.2s",
+                    }}>
+                      {copied ? "✓ Copied" : "⎘ Copy"}
+                    </button>
+                    <button onClick={downloadTxt} style={{
+                      padding: "6px 14px", borderRadius: 8, border: "1px solid var(--border2)",
+                      background: "var(--surface2)", color: "var(--text2)",
+                      cursor: "pointer", fontSize: 12, fontFamily: "DM Mono",
+                      transition: "all 0.2s",
+                    }}>
+                      ⬇ .txt
+                    </button>
+                  </div>
+                )}
+              </div>
 
-              <textarea
-                readOnly
-                value={result?.text ?? ""}
-                placeholder="Your Somali transcription will appear here..."
-                className="w-full h-48 rounded-xl p-4 text-sm resize-none outline-none text-slate-300 placeholder-slate-600"
-                style={{ background: "#0a1628", border: "1px solid #1e293b", lineHeight: "1.8" }}
-              />
+              {/* Transcript area */}
+              <div style={{ padding: 24, minHeight: 240 }}>
+                {stage === "idle" && !result && (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center",
+                    justifyContent: "center", minHeight: 200, gap: 12, opacity: 0.5 }}>
+                    <div style={{ fontSize: 48 }}>🎯</div>
+                    <div style={{ color: "var(--text3)", fontSize: 14,
+                      fontFamily: "DM Mono", textAlign: "center", lineHeight: 1.8 }}>
+                      Upload audio or video<br />and press Transcribe
+                    </div>
+                  </div>
+                )}
 
-              {/* Stats */}
-              {result && (
-                <div className="mt-3 p-3 rounded-lg text-xs flex flex-wrap gap-4"
-                  style={{ background: "rgba(13,115,119,0.08)", border: "1px solid rgba(13,115,119,0.2)" }}>
-                  <span className="text-slate-400">⏱ <span className="text-teal-400 font-medium">{result.elapsed.toFixed(1)}s</span></span>
-                  <span className="text-slate-400">📝 <span className="text-teal-400 font-medium">{result.wordCount}</span> words</span>
-                  <span className="text-slate-400">🔤 <span className="text-teal-400 font-medium">{result.charCount}</span> chars</span>
-                </div>
-              )}
+                {busy && (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center",
+                    justifyContent: "center", minHeight: 200, gap: 16 }}>
+                    <div style={{
+                      width: 48, height: 48, borderRadius: "50%",
+                      border: "3px solid var(--border)", borderTopColor: "var(--accent)",
+                      animation: "spin 0.8s linear infinite",
+                    }} />
+                    <div style={{ color: "var(--text2)", fontSize: 14,
+                      fontFamily: "DM Mono" }}>Processing Somali speech…</div>
+                  </div>
+                )}
 
-              {/* Action buttons */}
-              <div className="flex gap-3 mt-4">
-                <button onClick={copyText} disabled={!result}
-                  className="flex-1 py-2.5 px-4 rounded-xl font-medium text-sm flex items-center justify-center gap-2 transition-all disabled:opacity-30"
-                  style={{ background: "#1e293b", border: "1px solid #334155", color: "#94a3b8" }}>
-                  {copied ? <><CheckCheck size={16} className="text-green-400" /> Copied!</> : <><Copy size={16} /> Copy</>}
-                </button>
-                <button onClick={downloadTxt} disabled={!result}
-                  className="flex-1 py-2.5 px-4 rounded-xl font-medium text-sm flex items-center justify-center gap-2 transition-all disabled:opacity-30"
-                  style={{ background: "#1e293b", border: "1px solid #334155", color: "#94a3b8" }}>
-                  <Download size={16} /> Download .txt
-                </button>
+                {result && (
+                  <>
+                    <textarea readOnly value={result.text}
+                      style={{
+                        width: "100%", minHeight: 180, background: "var(--surface2)",
+                        border: "1px solid var(--border)", borderRadius: 12, padding: "14px 16px",
+                        color: "var(--text)", fontSize: 15, lineHeight: 1.9, resize: "vertical",
+                        fontFamily: "'Outfit', sans-serif", outline: "none",
+                        transition: "border 0.2s",
+                      }}
+                      onFocus={e => e.currentTarget.style.borderColor = "var(--accent)"}
+                      onBlur={e => e.currentTarget.style.borderColor = "var(--border)"}
+                    />
+
+                    {/* Stats cards */}
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)",
+                      gap: 8, marginTop: 12 }}>
+                      {[
+                        ["⏱", fmt(result.elapsed), "time"],
+                        ["📝", result.words.toLocaleString(), "words"],
+                        ["🔤", result.chars.toLocaleString(), "chars"],
+                        ["🏆", "0.20", "WER"],
+                      ].map(([icon, val, label]) => (
+                        <div key={label} style={{
+                          textAlign: "center", padding: "10px 6px", borderRadius: 10,
+                          background: "var(--surface2)", border: "1px solid var(--border)",
+                        }}>
+                          <div style={{ fontSize: 14, marginBottom: 2 }}>{icon}</div>
+                          <div style={{ fontFamily: "DM Mono", fontWeight: 500, fontSize: 15,
+                            color: "var(--accent)" }}>{val}</div>
+                          <div style={{ fontSize: 10, color: "var(--text3)",
+                            fontFamily: "DM Mono", letterSpacing: "0.08em",
+                            textTransform: "uppercase" }}>{label}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {stage === "error" && !result && (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center",
+                    justifyContent: "center", minHeight: 200, gap: 10 }}>
+                    <div style={{ fontSize: 40 }}>⚡</div>
+                    <div style={{ color: "var(--error)", fontSize: 14, textAlign: "center",
+                      fontFamily: "DM Mono", lineHeight: 1.6 }}>
+                      Check the error message on the left panel
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>
+
+          {/* ── FEATURE STRIP ───────────────────────────────────────────────── */}
+          <div style={{ display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+            gap: 12, marginTop: 20 }}>
+            {[
+              ["🔒", "Private", "Files processed in memory — never stored anywhere"],
+              ["⚡", "int8 Quantised", "2–3× faster CPU inference with minimal accuracy loss"],
+              ["🎬", "Video Support", "MP4, WebM, MKV — audio extracted automatically"],
+              ["🌍", "Open Source", "Apache 2.0 — use freely for research or production"],
+            ].map(([icon, title, desc]) => (
+              <div key={title} style={{
+                padding: "16px 18px", borderRadius: 14,
+                background: "var(--surface)", border: "1px solid var(--border)",
+                display: "flex", gap: 12, alignItems: "flex-start",
+              }}>
+                <span style={{ fontSize: 22, flexShrink: 0 }}>{icon}</span>
+                <div>
+                  <div style={{ fontFamily: "Syne", fontWeight: 700, fontSize: 13,
+                    color: "var(--text)", marginBottom: 3 }}>{title}</div>
+                  <div style={{ fontSize: 12, color: "var(--text2)", lineHeight: 1.5 }}>{desc}</div>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
 
-        {/* ── Features ── */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-8">
-          {[
-            { icon: "🔒", title: "Private & Secure", desc: "Files are processed directly — never stored on our servers." },
-            { icon: "🌍", title: "For the Community", desc: "Built specifically for Somali speakers, journalists, and researchers." },
-            { icon: "⚡", title: "State-of-the-Art", desc: "0.20 WER — the best available open-source Somali ASR model." },
-          ].map((f) => (
-            <div key={f.title} className="panel p-5">
-              <div className="text-2xl mb-3">{f.icon}</div>
-              <h3 className="font-semibold text-white mb-1">{f.title}</h3>
-              <p className="text-sm text-slate-500">{f.desc}</p>
-            </div>
-          ))}
-        </div>
+        {/* ── FOOTER ──────────────────────────────────────────────────────── */}
+        <footer style={{ borderTop: "1px solid var(--border)", padding: "20px 24px",
+          textAlign: "center", background: "var(--bg2)" }}>
+          <p style={{ fontSize: 12, color: "var(--text3)", fontFamily: "DM Mono" }}>
+            <strong style={{ color: "var(--text2)" }}>SomaliSTT</strong> by ooloteam · Powered by{" "}
+            <a href="https://huggingface.co/ooloteam/wav2vec2-somali" target="_blank"
+              rel="noreferrer"
+              style={{ color: "var(--accent)", textDecoration: "none" }}>
+              ooloteam/wav2vec2-somali
+            </a>{" "}
+            · Free forever for the Somali-speaking community 🌍
+          </p>
+        </footer>
       </div>
 
-      {/* ── Footer ── */}
-      <footer className="border-t border-slate-800/60 mt-16 py-8 text-center text-xs text-slate-600">
-        <p>
-          <strong className="text-slate-500">SomaliSTT</strong> — Powered by{" "}
-          <a href="https://huggingface.co/ooloteam/wav2vec2-somali"
-            className="hover:text-teal-400 transition-colors" target="_blank">
-            ooloteam/wav2vec2-somali
-          </a>{" "}
-          · Free forever for the Somali-speaking community
-        </p>
-      </footer>
-    </main>
+      {/* ── Keyframe animations ─────────────────────────────────────────── */}
+      <style>{`
+        @keyframes spin  { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+      `}</style>
+    </>
   );
 }
