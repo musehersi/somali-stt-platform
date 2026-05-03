@@ -611,7 +611,7 @@ export default function Home() {
                     {/* Record / Stop button */}
                     <button onClick={recording ? stopRecording : startRecording}
                       style={{
-                        width: "100%", padding: "14px", borderRadius: 12, border: "none",
+                        width: "100%", padding: "14px", borderRadius: 12,
                         cursor: "pointer", fontFamily: "Syne", fontWeight: 700, fontSize: 14,
                         letterSpacing: "0.05em", marginBottom: 12, transition: "all 0.2s",
                         background: recording
